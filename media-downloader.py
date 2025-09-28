@@ -12,6 +12,7 @@ import re
 import json
 from urllib.parse import urlparse
 from pathlib import Path
+import shutil
 
 
 class MediaDownloader:
@@ -110,28 +111,204 @@ class InstagramDownloader(MediaDownloader):
             r'(https?://)?(www\.)?instagram\.com/p/',
             r'(https?://)?(www\.)?instagram\.com/reel/',
             r'(https?://)?(www\.)?instagram\.com/tv/',
-            r'(https?://)?(www\.)?instagram\.com/stories/'
+            r'(https?://)?(www\.)?instagram\.com/stories/',
+            r'(https?://)?(www\.)?instagram\.com/[^/]+/?$'  # Profile URL
         ]
         return any(re.match(pattern, url) for pattern in patterns)
+
+    def is_profile_url(self, url):
+        """Check if URL is an Instagram profile URL"""
+        # Match URLs like instagram.com/username or instagram.com/username/
+        # but not specific posts, reels, etc.
+        pattern = r'^(https?://)?(www\.)?instagram\.com/([^/]+)/?$'
+        match = re.match(pattern, url)
+        if match:
+            username = match.group(3)
+            # Exclude Instagram's special pages
+            special_pages = ['p', 'reel', 'tv', 'stories', 'explore', 'accounts', 'about', 'legal', 'privacy']
+            return username not in special_pages
+        return False
+
+    def extract_username(self, url):
+        """Extract username from Instagram profile URL"""
+        pattern = r'^(https?://)?(www\.)?instagram\.com/([^/]+)/?$'
+        match = re.match(pattern, url)
+        if match:
+            return match.group(3)
+        return None
     
+    def _ensure_instaloader(self):
+        """Ensure instaloader is available"""
+        try:
+            import instaloader
+            return True
+        except ImportError:
+            print("Installing instaloader for Instagram profile downloads...")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "instaloader"], check=True)
+                return True
+            except subprocess.CalledProcessError:
+                return False
+
+    def download_profile(self, url, video=True, extra_args=None):
+        """Download all posts from an Instagram profile using instaloader"""
+        username = self.extract_username(url)
+        if not username:
+            raise ValueError("Could not extract username from URL")
+
+        # Try to use instaloader for profile downloads
+        if self._ensure_instaloader():
+            try:
+                import instaloader
+
+                # Create folder for this account
+                account_dir = self.output_dir / username
+                account_dir.mkdir(exist_ok=True)
+
+                print(f"Downloading all posts from Instagram profile: @{username}")
+                print(f"Files will be saved to: {account_dir}")
+
+                # Initialize Instaloader with custom settings
+                L = instaloader.Instaloader(
+                    dirname_pattern=str(account_dir),
+                    download_pictures=True,
+                    download_videos=True,
+                    download_video_thumbnails=False,
+                    download_geotags=False,
+                    download_comments=False,
+                    save_metadata=True,
+                    compress_json=False,
+                    filename_pattern="{date:%Y%m%d}_{mediaid}",
+                    quiet=False,
+                    request_timeout=60
+                )
+
+                # Load session cookies if available
+                session_loaded = False
+                if extra_args and "--cookies" in extra_args:
+                    cookie_file_idx = extra_args.index("--cookies") + 1
+                    if cookie_file_idx < len(extra_args):
+                        cookie_file = extra_args[cookie_file_idx]
+                        try:
+                            # Read cookie file and extract sessionid
+                            sessionid = None
+                            ds_user_id = None
+                            with open(cookie_file, 'r') as f:
+                                for line in f:
+                                    if line.startswith('#') or not line.strip():
+                                        continue
+                                    parts = line.strip().split('\t')
+                                    if len(parts) >= 7:
+                                        if parts[5] == 'sessionid':
+                                            sessionid = parts[6]
+                                        elif parts[5] == 'ds_user_id':
+                                            ds_user_id = parts[6]
+
+                            if sessionid:
+                                print(f"Loading session from cookies...")
+                                # Try to load existing session or create new one
+                                session_file = Path(f".instaloader-session-{username}")
+
+                                # Create a session using the import_session method
+                                # We need to manually set the cookies
+                                L.context._session.cookies.set('sessionid', sessionid, domain='.instagram.com')
+                                if ds_user_id:
+                                    L.context._session.cookies.set('ds_user_id', ds_user_id, domain='.instagram.com')
+
+                                # Test the session
+                                try:
+                                    L.context.test_login()
+                                    print(f"Session authenticated successfully!")
+                                    session_loaded = True
+                                except Exception:
+                                    print(f"Session authentication failed, trying without login...")
+                        except Exception as e:
+                            print(f"Warning: Could not load cookies: {e}")
+
+                # Get profile
+                profile = instaloader.Profile.from_username(L.context, username)
+
+                # Download all posts
+                post_count = 0
+                for post in profile.get_posts():
+                    L.download_post(post, target=profile.username)
+                    post_count += 1
+                    print(f"Downloaded post {post_count}")
+
+                print(f"\nSuccessfully downloaded {post_count} posts from @{username}!")
+                return
+
+            except Exception as e:
+                print(f"Instaloader failed: {e}")
+                print("Falling back to yt-dlp method...")
+
+        # Fallback to original yt-dlp method
+        # Create folder for this account
+        account_dir = self.output_dir / username
+        account_dir.mkdir(exist_ok=True)
+
+        # Build output template with post index for multiple media items
+        output_template = str(account_dir / "%(upload_date>%Y%m%d)s_%(title).100s_%(autonumber)s.%(ext)s")
+
+        cmd = [self.yt_dlp_path]
+
+        # Add extra arguments first if provided (includes cookies)
+        if extra_args:
+            cmd.extend(extra_args)
+
+        # Download highest quality media
+        cmd.extend([
+            "--write-description",  # Save post captions
+            "--write-info-json",  # Save metadata
+            "-o", output_template,
+            url
+        ])
+
+        print(f"Downloading all posts from Instagram profile: @{username}")
+        print(f"Files will be saved to: {account_dir}")
+
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"\nSuccessfully downloaded all media from @{username}!")
+
+            # Count downloaded files
+            media_files = list(account_dir.glob("*"))
+            media_count = len([f for f in media_files if f.suffix.lower() in ['.mp4', '.jpg', '.jpeg', '.png', '.webm']])
+            print(f"Total media files downloaded: {media_count}")
+
+        except subprocess.CalledProcessError as e:
+            print(f"Download failed: {e}")
+            print("\nNote: Instagram profile downloads require authentication.")
+            print("Please provide cookies using one of these options:")
+            print("  --cookies-from-browser chrome  (or firefox, safari, edge, etc.)")
+            print("  --cookies /path/to/cookies.txt")
+            sys.exit(1)
+
     def download(self, url, audio_only=True, format="wav", keep_video=False, extra_args=None):
         """Download Instagram media"""
         if not self.is_instagram_url(url):
             raise ValueError("Not a valid Instagram URL")
-        
+
+        # Check if this is a profile URL
+        if self.is_profile_url(url):
+            # For profiles, always download video and ignore audio-only settings
+            self.download_profile(url, video=True, extra_args=extra_args)
+            return
+
+        # Original single post/reel/story download logic
         output_template = str(self.output_dir / "%(title)s.%(ext)s")
-        
+
         cmd = [self.yt_dlp_path]
-        
+
         # Add extra arguments first if provided
         if extra_args:
             cmd.extend(extra_args)
-        
+
         # Instagram-specific options
         # For stories, download all items in the story
         if '/stories/' not in url:
             cmd.extend(["--no-playlist"])
-        
+
         # Only add format options if not listing formats
         if not extra_args or "--list-formats" not in extra_args:
             if audio_only:
@@ -141,9 +318,9 @@ class InstagramDownloader(MediaDownloader):
             else:
                 # Download best quality video+audio, merge if needed
                 cmd.extend(["-f", "bestvideo+bestaudio/best"])
-        
+
         cmd.extend(["-o", output_template, url])
-        
+
         print(f"Downloading from Instagram: {url}")
         try:
             subprocess.run(cmd, check=True)

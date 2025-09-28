@@ -1,0 +1,1 @@
+- we need to use the venv for any python poperations, installs etc. always activate it before any commands
